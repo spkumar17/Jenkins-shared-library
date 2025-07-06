@@ -1,8 +1,10 @@
 // vars/buildAndPushDocker.groovy
-import com.mycompany.ci.DockerUtils // Import the helper class
+import com.mycompany.ci.DockerUtils
+import com.mycompany.ci.BuildHelper
 
 def call(Map config) {
-    def dockerUtils = new DockerUtils(this) // Pass 'this' for pipeline steps
+    def dockerUtils = new DockerUtils(this)
+    def buildHelper = config.buildHelper ?: new BuildHelper(this)
 
     buildHelper.printMessage("Building Docker image for ${config.serviceName}...")
     dockerUtils.buildImage(config.serviceName, config.dockerfilePath, config.version)
