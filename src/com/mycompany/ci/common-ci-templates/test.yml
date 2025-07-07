@@ -1,0 +1,207 @@
+# Corrected GitLab CI/CD Configuration
+# stages: Defines the main, sequential flow of your pipeline. All jobs in one stage must finish successfully before any jobs in the next stage can start. Jobs within the same stage run in parallel.
+
+# needs: Allows jobs to start earlier by creating direct dependencies between individual jobs, overriding the strict stage order. A job with needs will run as soon as its specific "needed" jobs are done, even if other jobs in the "needed" job's stage are still running. It also automatically downloads artifacts from the jobs it needs.
+
+# dependencies: Used to control which artifacts are downloaded from jobs in previous stages. A job using dependencies will still wait for its stage to be reached (respecting the stages order), but it will only download artifacts from the specific jobs listed. (Note: needs often makes dependencies redundant because needs implies artifact download from the jobs it depends on).
+# use parent child relationship to define the stages and jobs in a GitLab CI/CD pipeline. The parent-child relationship allows you to structure your pipeline in a hierarchical manner, where the parent defines the overall configuration and the child jobs inherit or override specific settings.
+
+# The !reference [.docker_build_template, script] line explicitly tells GitLab CI/CD to insert and run the entire script content from the .docker_build_template (the template job) at that precise spot within the current job's own script section.
+
+# This means:
+
+# If you use !reference: Both the custom commands you write directly in your job's script AND the commands from the template's script (inserted via !reference) will be executed.
+
+# # If you don't use !reference: If your job extends a template but also defines its own script section without !reference, then the template's script will be completely ignored and only your job's custom script will run.
+#  if a job extends a template and the job itself does not have a script section defined, the job will not ignore the template's script.
+
+# Instead, the job will inherit the script directly from the template file. The template's script will be executed as the job's script.
+
+# include:
+#   # Include a template from a GitHub repository (e.g., from the 'main' branch)
+# https://raw.githubusercontent.com/{username}/{repository}/{branch_or_tag}/{path/to/your/template.yml}
+#   - remote: 'https://raw.githubusercontent.com/your-github-username/your-templates-repo/main/ci-templates/my-common-build.yml'
+
+# What it is: Unlike rules (which controls individual jobs), workflow:rules is a top-level keyword that controls whether the entire pipeline is created and runs at all. It's evaluated very early in the pipeline creation process.
+# .gitlab-ci.yml (at the very top level)
+
+workflow:
+  rules:
+    # Rule 1: Always create a pipeline for merge requests
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: Always # This means the pipeline will always run for merge requests, regardless of branch or changes
+    # Rule 2: Always create a pipeline for pushes to the default branch
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      when: always # This means the pipeline will always run for pushes to the default branch (e.g., 'main' or 'master')
+    # Rule 3: If none of the above, create a pipeline ONLY if files in 'src/' or 'config/' changed
+    - if: '$CI_COMMIT_BRANCH' # This checks if it's a branch pipeline (not MR, tag, etc.)
+      changes:
+        - src/**/*
+        - config/**/*
+      when: always # This means the pipeline will run if there are changes in 'src/' or 'config/' directories, but only for branch pipelines
+
+    # Rule 4: If no other rule matches, do NOT create the pipeline
+    - when: never # This means if none of the above conditions are met, the pipeline will not be created at all
+
+
+include:
+  - project: 'mycompany/common-ci-templates'
+    file: '/dockerpush.yml' # Include the docker push template from the common CI templates repository
+ 
+
+default: # Use 'default' keyword to set global configurations for all jobs
+  image: ubuntu:latest # This image will be used by all jobs by default, unless overridden
+  before_script: # 'before_script' can be defined globally under 'default'
+    - echo "Running global before scripts..."
+
+  variables: # Global variables can be defined here
+    - GLOBAL_VAR: "This is a global variable"
+# .gitlab-ci.yml
+  # This variable could be set manually when running a pipeline,
+  # or automatically by another job/script.
+    - DEPLOY_ENVIRONMENT: "staging" # Default value
+
+stages: # 'stages' is a top-level keyword
+  - build
+  - security
+  - dockerbuild
+  - dockerimagescan
+  - dockerpush # This is the order in which stages will run
+
+# Example job under 'build' stage
+build-job:
+  stage: build
+  image: docker:latest # This job explicitly specifies 'docker:latest', overriding the 'ubuntu:latest' default
+  services:
+    - docker:dind # Use Docker-in-Docker service
+  variables: # Job-specific variables can be defined here
+    localvariable: overlay2 # Example job-specific variabl  
+  before_script: # 'before_script' can be defined globally under 'default'
+    - echo "Running job specific before scripts..."  
+  script:
+    - echo "Running build..."
+    - echo "Using global variable $GLOBAL_VAR" # This will print the global variable defined above
+    - echo "Using job-specific variable $localvariable" # This will print the job-specific variable defined above
+  # If you wanted this job to use the global before_script, you wouldn't need to define it here.
+  # If you want a specific before_script for this job, you'd add it here:
+  # before_script:
+  #   - echo "Running build-job specific before script..."
+  cache:
+    key: "$CI_COMMIT_REF_SLUG-node-modules" # Unique cache key per branch
+    paths:
+      - node_modules/ # Directory to cache
+    policy: pull-push # Pull existing cache before job, push updated cache after job
+  # This job will run first. On its first successful run, it will upload the 'node_modules/'
+  # directory to GitLab's cache storage.
+
+# Placeholder for security stage
+security-scan:
+  stage: security
+  # This job will use the 'ubuntu:latest' image from the 'default' section
+  script:
+    - echo "Running security scan..."
+  # This job will also use the global before_script defined under 'default'
+  cache:
+    key: "$CI_COMMIT_REF_SLUG-node-modules" # Must use the SAME key as the 'install_dependencies' job
+    paths:
+      - node_modules/ # Must specify the SAME path to pull from
+    policy: pull # Only pull the cache, don't push (as this job doesn't modify dependencies)
+  needs: # 'needs' is a keyword that allows jobs to depend on other jobs
+    - build-job # This job depends on 'build-job', meaning it will run after it " build-job" completes successfully  
+
+
+docker-build:
+  stage: dockerbuild
+  image: docker:latest # This job explicitly specifies 'docker:latest', overriding the 'ubuntu:latest' default
+  services:
+    - docker:dind # Use Docker-in-Docker service
+    #The services keyword in GitLab CI/CD is a powerful feature that allows you to define additional Docker containers that run alongside your main job container. These "service containers" are typically used to provide network-accessible dependencies that your main application or tests need to function.
+  variables:
+    DOCKER_TLS_CERTDIR: "certs/client" # This variable is often used to configure Docker-in-Docker
+    DOCKER_TLS_VERIFY: "1" # Explicitly enable TLS verification
+    DOCKER_HOST: "tcp://docker:2376/" # This is the address of the Docker daemon running in the dind service
+
+    #For secure communication between the Docker client and daemon, Docker uses TLS. The DOCKER_TLS_CERTDIR variable tells the Docker client where to find the necessary TLS certificates (client certificate, client key, and CA certificate) to establish a secure, encrypted connection with the dind service. 
+    # /cert: This is a common conventional path within the docker:dind service container where the dind service itself generates and exposes these TLS certificates. By setting DOCKER_TLS_CERTDIR: "/cert" in your job's variables, you're instructing the Docker client in your job container to look for these certificates at that location.
+  script:
+    - echo "Building Docker image..."
+    - echo "Using global variable $GLOBAL_VAR" # This will print the global variable defined above
+  artifacts:
+  paths:
+    - docker-image-info.txt # Make sure this file is collected as an artifact
+  expire_in: 1 day
+  tags:
+    - docker # Tags can be used to specify which runners can pick up this job
+  when: manual # manual is a keyword in GitLab CI/CD that controls when a job is executed.
+  #When you set when: manual for a job, it means that the job will not run automatically as part of the pipeline's normal flow. Instead, it will appear in the GitLab UI with a "play" (▶) button, indicating that it requires a user to manually trigger its execution.  
+  rules:
+    - if: $CI_COMMIT_BRANCH == 'main' # Only on default branch
+      exists:
+        - Dockerfile # This job will only run if a Dockerfile exists in the job's context
+docker-image-scan:
+  stage: dockerimagescan
+  image: docker:latest # This job explicitly specifies 'docker:latest', overriding the 'ubuntu:latest' default
+  services:
+    - docker:dind # Use Docker-in-Docker service
+  script:
+    - echo "Scanning Docker image..."
+    - echo "Using global variable $GLOBAL_VAR" # This will print the global variable defined above
+  needs:
+    - docker-build # This job depends on 'docker-build' , meaning it will run after it completes successfully 
+
+dockerpush:
+  extends: .docker_push_template
+  needs:
+    - docker-build # This job depends on 'docker-build', meaning it will run after it completes successfully
+    - docker-image-scan # This job also depends on 'docker-image-scan', meaning it will run after it completes successfully
+
+  script:
+    - echo "Pushing Docker image to registry...
+    - echo "Using global variable $GLOBAL_VAR" # This will print the global variable defined above
+    - !reference [.docker_push_template, script] # This line explicitly tells GitLab CI/CD to insert and run the entire script content from the .docker_push_template (the template job) at that precise spot within the current job's own script section.  
+
+
+
+deploy_job:
+  stage: deploy
+  script:
+    - echo "Deploying to $DEPLOY_ENVIRONMENT..."
+  rules:
+    # Rule 1: Deploy to production if DEPLOY_ENVIRONMENT is 'production' and on main branch
+    - if: '$DEPLOY_ENVIRONMENT == "production" && $CI_COMMIT_BRANCH == "main"'
+      when: manual # Requires manual trigger for production
+    # Rule 2: Deploy to staging if DEPLOY_ENVIRONMENT is 'staging'
+    - if: '$DEPLOY_ENVIRONMENT == "staging" && $CI_COMMIT_BRANCH == "staging"' # What it is: This rule condition allows you to control job execution based on the value (or existence) of CI/CD variables.
+      when: on_success # Automatic for staging
+    # Rule 3: Don't run this job for any other DEPLOY_ENVIRONMENT value
+    - when: never
+
+
+deploy_stg:
+  stage: deploy
+  interruptible: true
+  script:
+    - echo "Deploying to staging environment..."
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "staging"'
+      when: on_success # This job will run automatically when the branch is 'staging'
+    - when: never # This means if the branch is not 'staging', this job will not run    
+
+
+# variables:
+#   DEPLEY_TARGET: # This is the name of your variable
+#     value: 'staging' # Default deployment target
+#     options:         # This defines the selectable options in the UI
+#       - staging
+#       - production
+
+# Here's a summary of the variables block defining DEPLEY_TARGET:
+# This variables configuration, placed at the top level of your .gitlab-ci.yml, creates a pipeline-level variable named DEPLEY_TARGET.
+# Its primary purpose is to provide a user-friendly dropdown selection for this variable when a pipeline is manually triggered from the GitLab UI.
+# value: 'staging': Sets the default value of DEPLEY_TARGET to 'staging'. This value is used automatically for non-manual pipeline runs (e.g., Git pushes) and pre-selected in the manual trigger form.
+# options: ['staging', 'production']: Defines the list of choices that will appear in a dropdown menu in the GitLab UI when a user manually runs a pipeline.
+# How it works:
+# Automatic pipelines: DEPLEY_TARGET will simply be 'staging'.
+# Manual pipelines: The user gets a dropdown to choose between 'staging' (default) and 'production'. The selected value is then passed to all jobs in that pipeline run.
+# This feature allows for interactive and controlled choices, typically for selecting deployment environments, directly from the GitLab UI, enhancing flexibility and user experience.
+# interruptible: true: Set this on jobs to allow GitLab to automatically cancel older, redundant pipelines on the same branch when a newer pipeline starts. This saves CI minutes and speeds up feedback.

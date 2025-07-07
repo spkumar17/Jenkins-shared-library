@@ -1,0 +1,305 @@
+# common-ci-templates/docker-build-template.yml
+# This template defines a reusable job for building and pushing Docker images.
+# It uses Docker-in-Docker (dind) for building images and logs into the GitLab Container Registry.
+# Variables like $CI_REGISTRY_USER, $CI_REGISTRY_PASSWORD, $CI_REGISTRY_IMAGE, and $SERVICE_NAME
+# are expected to be available from the parent or child pipeline.
+
+.docker_build_template:
+  image: docker:latest # Use the official Docker image for building
+  services:
+    - docker:dind # Required for Docker-in-Docker functionality
+  variables:
+    DOCKER_HOST: tcp://docker:2375 # Connect to the Docker daemon via TCP
+    DOCKER_TLS_CERTDIR: ""        # Disable TLS for simplicity in this example, use TLS in production
+    DOCKER_DRIVER: overlay2       # Specify the Docker storage driver
+  before_script:
+    # Log in to the GitLab Container Registry before building and pushing images.
+    # CI_REGISTRY_USER and CI_REGISTRY_PASSWORD are predefined GitLab CI/CD variables.
+    - echo "Logging into GitLab Container Registry..."
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+  script:
+    # Build the Docker image.
+    # --pull ensures that the latest base image is pulled.
+    # -t tags the image with the full registry path, service name, and commit SHA (for unique versioning).
+    # -t also tags with 'latest' for easy access to the most recent version.
+    # The '.' at the end specifies the build context (current directory).
+    - echo "Building Docker image for $SERVICE_NAME..."
+    - docker build --pull -t "$CI_REGISTRY_IMAGE/$SERVICE_NAME:$CI_COMMIT_SHORT_SHA" -t "$CI_REGISTRY_IMAGE/$SERVICE_NAME:latest" .
+    # Push the uniquely tagged image to the registry.
+    - echo "Pushing Docker image $CI_REGISTRY_IMAGE/$SERVICE_NAME:$CI_COMMIT_SHORT_SHA..."
+    - docker push "$CI_REGISTRY_IMAGE/$SERVICE_NAME:$CI_COMMIT_SHORT_SHA"
+    # Push the 'latest' tagged image to the registry.
+    - echo "Pushing Docker image $CI_REGISTRY_IMAGE/$SERVICE_NAME:latest..."
+    - docker push "$CI_REGISTRY_IMAGE/$SERVICE_NAME:latest"
+  artifacts:
+    # Define artifacts to be passed to subsequent jobs or for download.
+    # In this case, we might want to pass some image information if needed.
+    paths:
+      - docker-image-info.txt # Example: a file containing image details (e.g., image digest)
+    expire_in: 1 day # Artifacts will expire after 1 day to save storage
+  # Cache Docker layers to speed up subsequent builds.
+  # The key uses the service name and commit reference slug to ensure unique caches per service/branch.
+  cache:
+    key: "$SERVICE_NAME-$CI_COMMIT_REF_SLUG"
+    paths:
+      - .docker_cache/ # Example path for caching Docker build context or layers
+    policy: pull-push # Pull cache before job, push after job completion
+```
+Next, let's define a child pipeline for a specific microservice, for example, `service-a`. This file would reside in `services/service-a/.gitlab-ci.yml`.
+
+
+```yaml
+# services/service-a/.gitlab-ci.yml
+# This is the child pipeline configuration for 'service-a'.
+# It includes the common Docker build template and defines specific stages and jobs
+# for building, testing, and deploying 'service-a'.
+
+# Include the reusable Docker build template.
+# The path is relative to the root of the repository.
+include:
+  - ../../common-ci-templates/docker-build-template.yml
+
+# Define a service-specific variable. This will be used in the included template.
+variables:
+  SERVICE_NAME: service-a
+  # Define environment-specific variables for deployment
+  # These could also be defined at the project/group level with environment scoping
+  PRODUCTION_K8S_NAMESPACE: "production"
+  STAGING_K8S_NAMESPACE: "staging"
+  HELM_CHART_PATH: "./helm-chart" # Path to the Helm chart for this service
+
+# Define the stages for this microservice's pipeline.
+stages:
+  - build
+  - test
+  - deploy
+  - scan # Security scanning stage
+
+# Job to build the Docker image for service-a.
+# It extends the common Docker build template.
+build_service_a:
+  extends: .docker_build_template # Inherit configuration from the template
+  stage: build
+  script:
+    - echo "Building Service A Docker image..."
+    # Change directory to the service's root before executing the template's script.
+    - cd services/service-a
+    # Use !reference to include the script from the extended template.
+    # This ensures the template's script runs in the context of service-a's directory.
+    - !reference [.docker_build_template, script]
+  rules:
+    # This job runs only if changes are detected in the 'services/service-a' directory
+    # or if it's a new branch/merge request event.
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH || $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes:
+        - services/service-a/**/* # Wildcard to detect changes in any file/subdirectory
+  tags:
+    - docker-runner # Specify a tag for the runner that can build Docker images
+
+# Job to run unit and integration tests for service-a.
+test_service_a:
+  image: node:latest # Use a Node.js image for testing (assuming Node.js service)
+  stage: test
+  script:
+    - echo "Running tests for Service A..."
+    - cd services/service-a
+    - npm install # Install dependencies
+    - npm test # Run tests
+  needs:
+    # This job needs the 'build_service_a' job to complete successfully.
+    # It can run even if other jobs in the 'build' stage are still running,
+    # thanks to 'needs', accelerating the pipeline.
+    - build_service_a
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH || $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes:
+        - services/service-a/**/*
+  artifacts:
+    # Collect test reports as artifacts
+    reports:
+      junit: services/service-a/junit-report.xml # Example: JUnit XML report
+    paths:
+      - services/service-a/coverage/ # Example: Code coverage reports
+    expire_in: 1 week
+  cache:
+    key: "$SERVICE_NAME-npm-$CI_COMMIT_REF_SLUG"
+    paths:
+      - services/service-a/node_modules/ # Cache Node.js dependencies
+    policy: pull-push
+
+# Job for security scanning (e.g., SAST, Dependency Scanning)
+scan_service_a:
+  image: "registry.gitlab.com/gitlab-org/security-products/sast:latest" # Example SAST image
+  stage: scan
+  script:
+    - echo "Running security scan for Service A..."
+    - cd services/service-a
+    - /analyzer run # Command to run the SAST analyzer
+  artifacts:
+    reports:
+      sast: gl-sast-report.json # SAST report artifact
+    paths:
+      - gl-sast-report.json
+    expire_in: 1 day
+  needs:
+    - build_service_a # Scan after build, potentially using the built artifact
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH || $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes:
+        - services/service-a/**/*
+
+# Job to deploy service-a to a staging environment.
+# This job is manual for demonstration; in a real-world scenario, it might be automated.
+deploy_service_a_staging:
+  image: alpine/helm:latest # Use a Helm client image for Kubernetes deployments
+  stage: deploy
+  environment:
+    name: staging/service-a # Define the environment name for GitLab's Environments view
+    url: https://staging.service-a.example.com # URL to access the deployed service
+    action: start # Mark this as a deployment action
+  script:
+    - echo "Deploying Service A to Staging Kubernetes cluster..."
+    - cd services/service-a
+    # Example Helm command to upgrade/install the service.
+    # Assumes Kubernetes context is configured via GitLab Agent or CI/CD variables.
+    - helm upgrade --install service-a $HELM_CHART_PATH --namespace $STAGING_K8S_NAMESPACE --set image.tag=$CI_COMMIT_SHORT_SHA
+  needs:
+    - test_service_a # Deploy only after tests pass
+    - scan_service_a # Deploy only after security scans pass
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH # Only deploy staging from default branch
+      changes:
+        - services/service-a/**/*
+  when: manual # Manual deployment to staging
+
+# Job to deploy service-a to a production environment.
+# This job is typically manual and requires approval in a real-world setup.
+deploy_service_a_production:
+  image: alpine/helm:latest
+  stage: deploy
+  environment:
+    name: production/service-a
+    url: https://service-a.example.com
+    action: start
+  script:
+    - echo "Deploying Service A to Production Kubernetes cluster..."
+    - cd services/service-a
+    - helm upgrade --install service-a $HELM_CHART_PATH --namespace $PRODUCTION_K8S_NAMESPACE --set image.tag=$CI_COMMIT_SHORT_SHA
+  needs:
+    - test_service_a
+    - scan_service_a
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH # Only deploy production from default branch
+      changes:
+        - services/service-a/**/*
+  when: manual # Manual deployment to production
+  allow_failure: false # Production deployments should not fail silently
+  # Define protected environment to require manual approval for production deployments
+  # This setting is configured in GitLab UI under Deployments -> Environments -> Protected Environments
+  # environment:
+  #   name: production/service-a
+  #   protected: true # This keyword is for UI configuration, not directly in .gitlab-ci.yml
+```
+Finally, here is the main `.gitlab-ci.yml` file that orchestrates the child pipelines for all microservices. This file would be at the root of your monorepo.
+
+
+```yaml
+# .gitlab-ci.yml
+# This is the main parent pipeline that orchestrates the CI/CD for multiple microservices
+# in a monorepo structure. It uses parent-child pipelines and conditional triggering
+# based on file changes to optimize pipeline runs.
+
+# Define the main stage for triggering child pipelines.
+# All trigger jobs will run in this single stage.
+stages:
+  - trigger_microservices
+
+# Define a default image for trigger jobs if needed, though often not strictly necessary
+# as trigger jobs primarily call other pipelines.
+default:
+  image: alpine/git:latest # A minimal image for Git operations and triggering
+
+# Trigger job for Service A
+# This job will trigger the child pipeline defined in services/service-a/.gitlab-ci.yml
+trigger_service_a:
+  stage: trigger_microservices
+  trigger:
+    # Include the local child pipeline configuration file.
+    include:
+      - local: services/service-a/.gitlab-ci.yml
+    # 'strategy: depend' ensures that the parent pipeline waits for the child pipeline
+    # to complete and mirrors its status. This is crucial for end-to-end reliability.
+    strategy: depend
+  rules:
+    # This rule ensures the child pipeline for Service A is only triggered if:
+    # 1. The commit is on the default branch (e.g., 'main' or 'master').
+    # 2. The pipeline is triggered by a merge request event.
+    # 3. Changes are detected within the 'services/service-a' directory.
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH || $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes:
+        - services/service-a/**/* # Trigger if any file in service-a's directory changes
+  variables:
+    # Pass any common variables to the child pipeline if necessary.
+    # These variables will be available in the child pipeline.
+    SERVICE_A_ENV: "dev"
+    # Additional variables can be passed here, e.g., specific flags for child pipelines
+
+# Trigger job for Service B
+# This follows the same pattern as Service A.
+trigger_service_b:
+  stage: trigger_microservices
+  trigger:
+    include:
+      - local: services/service-b/.gitlab-ci.yml
+    strategy: depend
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH || $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes:
+        - services/service-b/**/*
+  variables:
+    SERVICE_B_ENV: "dev"
+
+# Trigger job for Service C
+# This follows the same pattern as Service A.
+trigger_service_c:
+  stage: trigger_microservices
+  trigger:
+    include:
+      - local: services/service-c/.gitlab-ci.yml
+    strategy: depend
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH || $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes:
+        - services/service-c/**/*
+  variables:
+    SERVICE_C_ENV: "dev"
+
+# ... (Add similar trigger jobs for the remaining 7 microservices: service-d to service-j) ...
+# Example for service-d:
+# trigger_service_d:
+#   stage: trigger_microservices
+#   trigger:
+#     include:
+#       - local: services/service-d/.gitlab-ci.yml
+#     strategy: depend
+#   rules:
+#     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH || $CI_PIPELINE_SOURCE == "merge_request_event"
+#       changes:
+#         - services/service-d/**/*
+#   variables:
+#     SERVICE_D_ENV: "dev"
+
+# Global cache definition (optional, can be overridden by jobs)
+# This cache could be used for common tools or dependencies needed by trigger jobs.
+cache:
+  key: "$CI_COMMIT_REF_SLUG"
+  paths:
+    - .cache/global/
+  policy: pull-push
+
+# Define workflow rules to control when the parent pipeline runs.
+# This helps prevent unnecessary parent pipeline runs (e.g., on tag pushes not related to releases).
+workflow:
+  rules:
+    - if: $CI_COMMIT_BRANCH
+    - if: $CI_MERGE_REQUEST_IID

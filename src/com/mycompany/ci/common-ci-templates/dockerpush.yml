@@ -1,0 +1,21 @@
+
+.docker_push_template:
+  stage: dockerpush
+  image: docker:latest
+  services:
+    - docker:dind
+  variables:
+    DOCKER_TLS_CERTDIR: "certs/client"
+    DOCKER_HOST: "tcp://docker:2375/" # Use TCP connection to Docker daemon
+    DOCKER_TLS_VERIFY: "1" # Enable TLS verification
+  before_script:
+    - echo "Running Docker push job specific before scripts..."
+  script:
+    - echo "Pushing Docker image to registry..."
+    - docker login -u "$DOCKER_USERNAME" -p "$DOCKER_PASSWORD"
+    - docker push "$DOCKER_IMAGE_NAME:$CI_COMMIT_REF_SLUG"
+  cache:
+    key: "$CI_COMMIT_REF_SLUG-docker-cache"
+    paths:
+      - .docker/
+    policy: pull-push
