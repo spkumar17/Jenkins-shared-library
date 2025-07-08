@@ -24,6 +24,7 @@
 
 # What it is: Unlike rules (which controls individual jobs), workflow:rules is a top-level keyword that controls whether the entire pipeline is created and runs at all. It's evaluated very early in the pipeline creation process.
 # .gitlab-ci.yml (at the very top level)
+    # - scp src/adservice/build/libs/*.jar user@prod-server:/opt/app/ recheck again
 
 workflow:
   rules:
